@@ -1,0 +1,30 @@
+name: netlink-hs
+version: 0.1.0
+license: MIT
+
+dependencies:
+  - base
+  - ip
+  - mtl
+  - network
+  - text
+  - wide-word
+
+default-extensions:
+  - DerivingVia
+  - GeneralizedNewtypeDeriving
+  - ForeignFunctionInterface
+  - PatternSynonyms
+  - ScopedTypeVariables
+  - GADTs
+  - DeriveAnyClass
+
+library:
+  exposed-modules:
+    - System.Network.Netlink.Types
+    - System.Network.Netlink.Route
+    - System.Network.Netlink
+
+  pkg-config-dependencies:
+    - libnl-3.0
+    - libnl-route-3.0
