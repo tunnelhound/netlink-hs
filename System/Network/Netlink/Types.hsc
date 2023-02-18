@@ -8,7 +8,7 @@ import           Control.Exception (Exception, bracket, throwIO)
 import           Data.Bits (Bits, (.|.), zeroBits)
 import qualified Data.Text as T
 import           Data.WideWord.Word128 (byteSwapWord128)
-import           Data.Word (Word32)
+import           Data.Word (Word32, Word8)
 
 import           Foreign.C.String (peekCString)
 import           Foreign.C.Types
@@ -49,6 +49,7 @@ foreign import ccall unsafe "nl_object_get" c_nl_object_get :: Ptr a -> IO ()
 foreign import ccall unsafe "&nl_object_put" c_nl_object_put :: FunPtr (Ptr a -> IO ())
 
 newtype NlObject a = NlObject (ForeignPtr a)
+newtype NlUnownedObject a = NlUnownedObject (ForeignPtr a)
 
 class HasNlObject what where
   withNlObject :: what -> (Ptr what -> IO a) -> IO a
@@ -67,6 +68,10 @@ data NlAttribute what a
 instance HasNlObject (NlObject a) where
   withNlObject (NlObject a) action = withForeignPtr a (action . castPtr)
   fromNlPtr ptr = NlObject <$> newForeignPtr c_nl_object_put (castPtr ptr)
+
+instance HasNlObject (NlUnownedObject a) where
+  withNlObject (NlUnownedObject a) action = withForeignPtr a (action . castPtr)
+  fromNlPtr ptr = NlUnownedObject <$> newForeignPtr_ (castPtr ptr)
 
 nlSet :: (MonadIO m, HasNlObject what) => NlAttribute what a -> what -> a -> m ()
 nlSet attr what newValue =
@@ -235,6 +240,10 @@ data LinkAddr
   | LinkAddrInet6 !IPv6
   deriving (Show, Eq, Ord)
 
+data NetAddr
+  = NetAddr LinkAddr Word8
+    deriving (Show, Eq, Ord)
+
 encodeLinkAddress :: LinkAddr -> T.Text
 encodeLinkAddress (LinkAddrInet a) = IPv4.encode a
 encodeLinkAddress (LinkAddrInet6 a) = IPv6.encode a
@@ -278,6 +287,9 @@ foreign import ccall unsafe "nl_addr_build" c_nl_addr_build
 foreign import ccall unsafe "nl_addr_put" c_nl_addr_put :: Ptr NlAddr -> IO ()
 foreign import ccall unsafe "nl_addr_get_binary_addr" c_nl_addr_get_binary_addr :: Ptr NlAddr -> IO (Ptr LinkAddr)
 foreign import ccall unsafe "nl_addr_get_family" c_nl_addr_get_family :: Ptr NlAddr -> IO CInt
+foreign import ccall unsafe "nl_addr_get_prefixlen" c_nl_addr_get_prefixlen :: Ptr NlAddr -> IO CInt
+foreign import ccall unsafe "nl_addr_set_prefixlen" c_nl_addr_set_prefixlen :: Ptr NlAddr -> CInt -> IO ()
+
 
 withNlAddr :: LinkAddr -> (Ptr NlAddr -> IO a) -> IO a
 withNlAddr linkAddr withAddr = do
@@ -285,6 +297,12 @@ withNlAddr linkAddr withAddr = do
     bracket (c_nl_addr_build (Network.packFamily family) linkAddrPtr
                   (sizeOfLinkAddress linkAddr))
             c_nl_addr_put withAddr
+
+withNlNetAddr :: NetAddr -> (Ptr NlAddr -> IO a) -> IO a
+withNlNetAddr (NetAddr linkAddr len) withAddr =
+  withNlAddr linkAddr $ \nlAddr -> do
+    c_nl_addr_set_prefixlen nlAddr (fromIntegral len)
+    withAddr nlAddr
 
 nlSockAddrAttribute :: (Ptr what -> Ptr NlAddr -> IO ())
                     -> (Ptr what-> IO (Ptr NlAddr))
@@ -307,3 +325,24 @@ nlSockAddrAttribute setNlAddr getNlAddr =
 
                       Just <$> peekLinkAddress (Network.unpackFamily family) addrPtr)
 
+nlNetAddrAttribute :: (Ptr what -> Ptr NetAddr -> IO ())
+                    -> (Ptr what-> IO (Ptr NetAddr))
+                    -> NlAttribute what (Maybe NetAddr)
+nlNetAddrAttribute setNlAddr getNlAddr =
+  NlAttribute (\what mSockAddr ->
+                 case mSockAddr of
+                   Nothing -> setNlAddr what nullPtr
+                   Just netAddr ->
+                     withNlNetAddr netAddr $ \netAddrPtr ->
+                       setNlAddr what (castPtr netAddrPtr))
+              (\what -> do
+                 nlAddr <- castPtr <$> getNlAddr what -- This does not increase the reference count
+
+                 if nlAddr == nullPtr
+                    then pure Nothing
+                    else do
+                      addrPtr <- c_nl_addr_get_binary_addr nlAddr
+                      family <- c_nl_addr_get_family nlAddr
+                      prefix <- c_nl_addr_get_prefixlen nlAddr
+
+                      Just <$> (NetAddr <$> peekLinkAddress (Network.unpackFamily family) addrPtr <*> pure (fromIntegral prefix)))

@@ -10,7 +10,8 @@ import           Control.Monad.IO.Class (MonadIO(..))
 import           Data.Bits
 import           Data.Foldable (toList)
 import qualified Data.Text as T
-import           Data.Word (Word8)
+import           Data.Traversable (forM)
+import           Data.Word (Word8, Word32)
 
 import           Foreign.C.String (CString, peekCString, withCString)
 import           Foreign.C.Types
@@ -277,7 +278,109 @@ syncLinkAddresses nl link newAddrs = do
   forM_ newAddrs $ \newAddr ->
     -- Check if this address exists already
     unless (newAddr `elem` curAddrs) $ -- When it doesn't exist exactly as stated add it
-      rtnlAddrAdd nl =<< rtnlAddrFromDetails linkIndex newAddr
+      rtnlAddrAdd nl =<<
+      rtnlAddrFromDetails linkIndex newAddr
 
   forM_ deletedAddresses $ \deleted -> do
     rtnlAddrDelete nl deleted
+
+-- * Routes
+
+-- | A route message
+newtype RtnlRoute = RtnlRoute (ForeignPtr RtnlRoute)
+    deriving (Show, Eq, Ord)
+    deriving HasNlObject via NlObject RtnlRoute
+
+-- | Nexthop object
+newtype RtnlNexthop = RtnlNexthop (ForeignPtr RtnlNexthop)
+    deriving (Show, Eq, Ord)
+    deriving HasNlObject via NlUnownedObject RtnlNexthop
+
+foreign import ccall unsafe "rtnl_route_alloc_cache" c_rtnl_route_alloc_cache :: NlSock -> Ptr (Ptr (NlCache RtnlRoute)) -> IO NlError
+
+rtnlRouteGetAll :: MonadIO m => NlSock -> m (NlCache RtnlRoute)
+rtnlRouteGetAll sock =
+    liftIO $ alloca $ \resultPtr -> do
+      translateNlError (c_rtnl_route_alloc_cache sock resultPtr)
+      cachePtr <- peek resultPtr
+      NlCache <$> newForeignPtr c_nl_cache_free cachePtr <*> pure id
+
+newtype RouteFamily = RouteFamily Word8
+    deriving (Show, Eq, Ord)
+
+foreign import ccall unsafe "rtnl_route_get_family" c_rtnl_route_get_family :: Ptr RtnlRoute -> IO RouteFamily
+foreign import ccall unsafe "rtnl_route_set_family" c_rtnl_route_set_family :: Ptr RtnlRoute -> RouteFamily -> IO ()
+
+routeFamily :: NlAttribute RtnlRoute RouteFamily
+routeFamily = NlAttribute c_rtnl_route_set_family c_rtnl_route_get_family
+
+foreign import ccall unsafe "rtnl_route_get_dst" c_rtnl_route_get_dst :: Ptr RtnlRoute -> IO (Ptr NetAddr)
+foreign import ccall unsafe "rtnl_route_set_dst" c_rtnl_route_set_dst :: Ptr RtnlRoute -> Ptr NetAddr -> IO ()
+
+routeDestination :: NlAttribute RtnlRoute (Maybe NetAddr)
+routeDestination = nlNetAddrAttribute c_rtnl_route_set_dst c_rtnl_route_get_dst
+
+type RouteTableId = Word32
+
+foreign import ccall unsafe "rtnl_route_get_table" c_rtnl_route_get_table :: Ptr RtnlRoute -> IO RouteTableId
+foreign import ccall unsafe "rtnl_route_set_table" c_rtnl_route_set_table :: Ptr RtnlRoute -> RouteTableId -> IO ()
+
+routeTable :: NlAttribute RtnlRoute RouteTableId
+routeTable = NlAttribute c_rtnl_route_set_table c_rtnl_route_get_table
+
+type RoutePriority = Word32
+
+foreign import ccall unsafe "rtnl_route_get_priority" c_rtnl_route_get_priority :: Ptr RtnlRoute -> IO RoutePriority
+foreign import ccall unsafe "rtnl_route_set_priority" c_rtnl_route_set_priority :: Ptr RtnlRoute -> RoutePriority -> IO ()
+
+routePriority :: NlAttribute RtnlRoute RoutePriority
+routePriority = NlAttribute c_rtnl_route_set_priority c_rtnl_route_get_priority
+
+foreign import ccall unsafe "rtnl_route_get_nnexthops" c_rtnl_route_get_nnexthops :: Ptr RtnlRoute -> IO CInt
+foreign import ccall unsafe "rtnl_route_nexthop_n" c_rtnl_route_nexthop_n :: Ptr RtnlRoute -> CInt -> IO (Ptr RtnlNexthop)
+
+routeNexthops :: RtnlRoute -> IO [RtnlNexthop]
+routeNexthops route = withNlObject route $ \routePtr -> do
+                        count <- c_rtnl_route_get_nnexthops routePtr
+                        forM [0..(count - 1)] $ \i ->
+                            fromNlPtr =<< c_rtnl_route_nexthop_n routePtr i
+
+foreign import ccall unsafe "rtnl_route_add_nexthop" c_rtnl_route_add_nexthop :: Ptr RtnlRoute -> Ptr RtnlNexthop -> IO ()
+foreign import ccall unsafe "rtnl_route_remove_nexthop" c_rtnl_route_remote_nexthop :: Ptr RtnlRoute -> Ptr RtnlNexthop -> IO ()
+
+foreign import ccall unsafe "rtnl_route_nh_get_weight" c_rtnl_route_nh_get_weight :: Ptr RtnlNexthop -> IO Word8
+foreign import ccall unsafe "rtnl_route_nh_set_weight" c_rtnl_route_nh_set_weight :: Ptr RtnlNexthop -> Word8 -> IO ()
+
+nexthopWeight :: NlAttribute RtnlNexthop Word8
+nexthopWeight = NlAttribute c_rtnl_route_nh_set_weight c_rtnl_route_nh_get_weight
+
+foreign import ccall unsafe "rtnl_route_nh_get_ifindex" c_rtnl_route_nh_get_ifindex :: Ptr RtnlNexthop -> IO CInt
+foreign import ccall unsafe "rtnl_route_nh_set_ifindex" c_rtnl_route_nh_set_ifindex :: Ptr RtnlNexthop -> CInt -> IO ()
+
+nexthopIfIndex :: NlAttribute RtnlNexthop CInt
+nexthopIfIndex = NlAttribute c_rtnl_route_nh_set_ifindex c_rtnl_route_nh_get_ifindex
+
+foreign import ccall unsafe "rtnl_route_nh_get_gateway" c_rtnl_route_nh_get_gateway :: Ptr RtnlNexthop -> IO (Ptr NlAddr)
+foreign import ccall unsafe "rtnl_route_nh_set_gateway" c_rtnl_route_nh_set_gateway :: Ptr RtnlNexthop -> Ptr NlAddr -> IO ()
+
+nexthopGateway :: NlAttribute RtnlNexthop (Maybe LinkAddr)
+nexthopGateway = nlSockAddrAttribute c_rtnl_route_nh_set_gateway c_rtnl_route_nh_get_gateway
+
+showRoute :: RtnlRoute -> IO ()
+showRoute rt = do
+  table <- nlGet routeTable rt
+  dst <- nlGet routeDestination rt
+  family <- nlGet routeFamily rt
+  prio <- nlGet routePriority rt
+  nexthops <- routeNexthops rt
+
+  putStrLn ("TABLE " ++ show table ++ "  Route: " ++ show dst)
+  putStrLn ("  Prio: " ++ show prio ++ ", family: " ++ show family)
+
+  forM_ (zip [0..] nexthops) $ \(i, nh) -> do
+    ifIndex <- nlGet nexthopIfIndex nh
+    weight <- nlGet nexthopWeight nh
+    gw <- nlGet nexthopGateway nh
+
+    putStrLn ("   Nexthop " ++ show i ++ ": " ++
+              show gw ++ " weight: " ++ show weight ++ ", dev: " ++ show ifIndex)
